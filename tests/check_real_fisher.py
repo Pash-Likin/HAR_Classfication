@@ -13,7 +13,7 @@ from threadpoolctl import threadpool_limits
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src'))
 from har_study.data import find_dataset_root,load_split
-from har_study.study import grouped_folds,make_classifier,make_pipeline
+from har_study.study import METHODS,grouped_folds,make_classifier,make_pipeline
 from har_study.search import prepare_fold,representation
 
 
@@ -24,22 +24,22 @@ def check():
     records=[]
     with tempfile.TemporaryDirectory(prefix='har_fisher_check_') as td,threadpool_limits(limits=1):
         cache=Path(td)
-        prepare_fold(train,tr,va,200,cache)
-        for method in ('full','pca','anova'):
-            k=561 if method=='full' else 200
-            X,V,y,truth=representation(cache,method,k)
-            for shrinkage in config['lda_grid']['model__shrinkage']:
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter('always')
-                    model=make_classifier('FisherLDA',config).set_params(shrinkage=shrinkage)
-                    model.fit(X,y);a=model.predict(V)
-                    pipeline=make_pipeline('FisherLDA',method,k,config).set_params(model__shrinkage=shrinkage)
-                    pipeline.fit(train.X[tr],train.y[tr]);b=pipeline.predict(train.X[va])
-                mismatches=int(np.sum(a!=b))
-                if mismatches:raise AssertionError(f'{method}/{shrinkage}预测不同：{mismatches}')
-                records.append({'method':method,'k':k,'shrinkage':shrinkage,'validation_rows':len(va),
-                                'prediction_mismatches':mismatches,
-                                'warnings':[str(w.message) for w in caught]})
+        prepare_fold(train,tr,va,max(config['dimensions']),cache)
+        for method in METHODS:
+            for k in ([train.X.shape[1]] if method=='full' else config['dimensions']):
+                X,V,y,truth=representation(cache,method,k)
+                for shrinkage in config['lda_grid']['model__shrinkage']:
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter('always')
+                        model=make_classifier('FisherLDA',config).set_params(shrinkage=shrinkage)
+                        model.fit(X,y);a=model.predict(V)
+                        pipeline=make_pipeline('FisherLDA',method,k,config).set_params(model__shrinkage=shrinkage)
+                        pipeline.fit(train.X[tr],train.y[tr]);b=pipeline.predict(train.X[va])
+                    mismatches=int(np.sum(a!=b))
+                    if mismatches:raise AssertionError(f'{method}/{k}/{shrinkage}预测不同：{mismatches}')
+                    records.append({'method':method,'k':k,'shrinkage':shrinkage,'validation_rows':len(va),
+                                    'prediction_mismatches':mismatches,
+                                    'warnings':[str(w.message) for w in caught]})
     return {'status':'PASS','scope':'训练人员第一折；共享预处理与完整Pipeline的FisherLDA预测一致性，不是新的测试集实验成绩。',
             'train_subjects':sorted(map(int,np.unique(train.subjects[tr]))),
             'validation_subjects':sorted(map(int,np.unique(train.subjects[va]))),

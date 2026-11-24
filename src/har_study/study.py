@@ -21,12 +21,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.metrics import (
     accuracy_score, balanced_accuracy_score, confusion_matrix, f1_score,
     precision_recall_fscore_support, make_scorer,
 )
-from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold, StratifiedKFold
+from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
@@ -37,7 +36,7 @@ from .data import ACTIVITIES, Split, audit_splits, file_hashes, load_split, sha2
 LABELS = list(ACTIVITIES)
 MODELS = ("RBF_SVM", "RandomForest", "LogisticRegression", "KNN", "FisherLDA")
 GRID_KEYS = {"RBF_SVM": "svm_grid", "RandomForest": "rf_grid", "LogisticRegression": "lr_grid", "KNN": "knn_grid", "FisherLDA": "lda_grid"}
-METHODS = ("full", "pca", "anova")
+METHODS = ("full", "pca")
 SCORING = {
     "macro_f1": make_scorer(f1_score, labels=LABELS, average="macro", zero_division=0),
     "accuracy": "accuracy", "balanced_accuracy": "balanced_accuracy",
@@ -62,12 +61,12 @@ def dump_json(path: Path, obj: dict | list) -> None:
 def save_table(rows, path: Path) -> pd.DataFrame:
     frame = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(path, index=False, encoding="utf-8-sig", float_format="%.12g")
+    frame.to_csv(path, index=False, encoding="utf-8-sig", float_format="%.17g")
     return frame
 
 
 def validate_config(c: dict, *, n_features: int = 561) -> None:
-    required = {"seed", "cv_folds", "dimensions", "allowed_macro_f1_drop", "svm_grid",
+    required = {"seed", "cv_folds", "dimensions", "pca_selection", "svm_grid",
                 "rf_grid", "rf_trees", "timing_repeats", "timing_warmups",
                 "latency_sample_count", "bootstrap_repeats", "models", "lr_grid", "knn_grid", "lda_grid"}
     if set(c) != required:
@@ -80,8 +79,8 @@ def validate_config(c: dict, *, n_features: int = 561) -> None:
         raise ValueError("dimensions 必须为非空、递增、无重复列表。")
     if any(not isinstance(k, int) or k <= 0 or k >= n_features for k in c["dimensions"]):
         raise ValueError("压缩维数必须小于输入维数。")
-    if not 0 <= c["allowed_macro_f1_drop"] < 1:
-        raise ValueError("性能容忍范围应以0～1的小数填写；0.01表示1个百分点。")
+    if c["pca_selection"] != "highest_cv_macro_f1":
+        raise ValueError("pca_selection必须为highest_cv_macro_f1：按训练交叉验证Macro-F1最高分选维数。")
     for key in ("rf_trees", "timing_repeats", "timing_warmups", "latency_sample_count", "bootstrap_repeats"):
         if not isinstance(c[key], int) or c[key] < 1: raise ValueError(f"{key} 必须为正整数。")
     if set(c["svm_grid"]) != {"model__C", "model__gamma"}:
@@ -120,9 +119,6 @@ def make_pipeline(model: str, method: str, k: int, c: dict, memory=None) -> Pipe
     if method == "pca":
         # 固定完整SVD，不使用随机近似；不同维数不依赖随机初始化。
         reducer = PCA(n_components=k, svd_solver="full", whiten=False)
-    elif method == "anova":
-        # ANOVA F值只用于排序。窗口不独立，不能把F检验p值解释为可靠的显著性证据。
-        reducer = SelectKBest(score_func=f_classif, k=k)
     classifier = make_classifier(model, c)
     # 所有路径都用同一标准化策略，避免把压缩收益与额外预处理差异混在一起。
     return Pipeline([("scale", StandardScaler()), ("reduce", reducer), ("model", classifier)], memory=memory)
@@ -180,70 +176,60 @@ def search_candidates(data: Split, c: dict, folds: list, out: Path, workers: int
     return cached_grid_search(data, c, folds, out, workers, cache)
 
 
-def select_configs(candidates: pd.DataFrame, tolerance: float) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """每条压缩路线选满足容忍范围的最小k。没有达标时保留最佳诊断方案并明确标失败。"""
+def select_configs(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """每个k先取最佳参数，再选CV Macro-F1最高的k；完全同分时选较小k。"""
+    if not set(candidates["method"]) <= set(METHODS):
+        raise ValueError("当前实验只接受full基准和pca降维候选，不能混入历史特征筛选结果。")
     order = candidates.sort_values(["cv_macro_f1", "candidate_id"], ascending=[False, True], kind="stable")
     curve = order.drop_duplicates(["model", "method", "k"]).copy()
     selections = []
     for model in [m for m in MODELS if m in set(curve.model)]:
+        if set(curve.loc[curve.model == model, "method"]) != set(METHODS):
+            raise ValueError(f"{model}必须同时包含full基准和pca候选。")
         baseline = curve[(curve.model == model) & (curve.method == "full")].iloc[0]
-        threshold = float(baseline.cv_macro_f1) - tolerance
         for method in METHODS:
             options = curve[(curve.model == model) & (curve.method == method)].copy()
-            eligible = options[options.cv_macro_f1 >= threshold - 1e-12]
-            passed = not eligible.empty
             if method == "full":
                 chosen = baseline
-            elif passed:
-                chosen = eligible.sort_values(["k", "cv_macro_f1", "candidate_id"], ascending=[True, False, True]).iloc[0]
             else:
-                chosen = options.sort_values(["cv_macro_f1", "k", "candidate_id"], ascending=[False, True, True]).iloc[0]
+                chosen = options.sort_values(["cv_macro_f1", "k", "candidate_id"],
+                                             ascending=[False, True, True], kind="stable").iloc[0]
             row = chosen.to_dict()
-            row.update({"selection_id": f"{model}__{method}", "cv_threshold": threshold,
-                        "meets_cv_tolerance": passed, "cv_delta_from_full_pp":
+            row.update({"selection_id": f"{model}__{method}", "cv_delta_from_full_pp":
                         100 * (float(chosen.cv_macro_f1) - float(baseline.cv_macro_f1)),
-                        "selection_rule": "baseline" if method == "full" else
-                        "smallest_eligible_k" if passed else "best_cv_but_failed_tolerance"})
+                        "selection_rule": "baseline" if method == "full" else "highest_cv_macro_f1",
+                        "selection_metric": "cv_macro_f1"})
             selections.append(row)
     return pd.DataFrame(selections), curve.sort_values(["model", "method", "k"])
 
 
-def protocol_comparison(data: Split, c: dict, grouped: list, out: Path) -> None:
-    """固定参数比较两种验证协议，只在官方训练集内进行，不参与选模。"""
-    random_folds = list(StratifiedKFold(n_splits=c["cv_folds"], shuffle=True,
-                        random_state=c["seed"]).split(data.X, data.y))
-    records, predictions = [], []
-    for model in c["models"]:
-        for protocol, folds in (("subject_grouped", grouped), ("random_windows", random_folds)):
-            for fid, (tr, va) in enumerate(folds):
-                pipe = make_pipeline(model, "full", data.X.shape[1], c)
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error", ConvergenceWarning)
-                    pipe.fit(data.X[tr], data.y[tr])
-                pred = pipe.predict(data.X[va])
-                score = metrics(data.y[va], pred)
-                records.append({"model": model, "protocol": protocol, "fold": fid,
-                                "train_n": len(tr), "validation_n": len(va),
-                                "overlap_subject_count": len(set(data.subjects[tr]) & set(data.subjects[va])), **score})
-                for row, val in zip(va, pred):
-                    predictions.append({"model": model, "protocol": protocol, "fold": fid,
-                        "row_id": int(row), "subject": int(data.subjects[row]),
-                        "actual": int(data.y[row]), "predicted": int(val)})
-            print(f"[Protocol] {model} / {protocol} finished (fixed parameters)", flush=True)
-    save_table(records, out / "tables/protocol_comparison.csv")
-    save_table(predictions, out / "tables/protocol_predictions.csv")
-
-
 def fit_selected(train: Split, selected: pd.DataFrame, c: dict, out: Path) -> dict:
-    fitted, fit_rows, features, pca_rows = {}, [], [], []
+    fitted, fit_rows, pca_rows = {}, [], []
     for row in selected.to_dict("records"):
         sid = row["selection_id"]
         pipe = make_pipeline(row["model"], row["method"], int(row["k"]), c)
         pipe.set_params(**json.loads(row["params_json"]))
+        # 分阶段计时直接发生在最终模型的这次真实训练中，不额外训练第二份模型。
+        # 与sklearn Pipeline.fit的默认执行顺序一致：scale.fit_transform ->
+        # reduce.fit_transform(若有) -> model.fit；所有对象均保留在同一Pipeline内。
         start = time.perf_counter()
         with warnings.catch_warnings():
             warnings.simplefilter("error", ConvergenceWarning)
-            pipe.fit(train.X, train.y)
+            tick = time.perf_counter()
+            train_scaled = pipe.named_steps["scale"].fit_transform(train.X, train.y)
+            scale_fit_seconds = time.perf_counter() - tick
+
+            if row["method"] == "pca":
+                tick = time.perf_counter()
+                train_features = pipe.named_steps["reduce"].fit_transform(train_scaled, train.y)
+                reduce_fit_seconds = time.perf_counter() - tick
+            else:
+                train_features = train_scaled
+                reduce_fit_seconds = 0.0
+
+            tick = time.perf_counter()
+            pipe.named_steps["model"].fit(train_features, train.y)
+            classifier_fit_seconds = time.perf_counter() - tick
         fit_seconds = time.perf_counter() - start
         path = out / "models" / f"{sid}.joblib"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -251,16 +237,15 @@ def fit_selected(train: Split, selected: pd.DataFrame, c: dict, out: Path) -> di
         joblib.dump(pipe, path, compress=3)
         fitted[sid] = pipe
         fit_rows.append({"selection_id": sid, "final_fit_seconds": fit_seconds,
+                         "scale_fit_seconds": scale_fit_seconds,
+                         "reduce_fit_seconds": reduce_fit_seconds,
+                         "classifier_fit_seconds": classifier_fit_seconds,
+                         "final_fit_n_samples": int(len(train.y)),
                          "pipeline_bytes": path.stat().st_size,
                          "model_sha256": sha256(path),
                          "support_vector_count": int(pipe.named_steps['model'].support_vectors_.shape[0])
                          if row["model"] == "RBF_SVM" else None})
-        if row["method"] == "anova":
-            reducer = pipe.named_steps["reduce"]
-            for j in reducer.get_support(indices=True):
-                features.append({"selection_id": sid, "feature_index_1based": int(j) + 1,
-                    "feature_name": train.feature_names[j], "f_score": float(reducer.scores_[j])})
-        elif row["method"] == "pca":
+        if row["method"] == "pca":
             reducer = pipe.named_steps["reduce"]
             for j, fraction in enumerate(reducer.explained_variance_ratio_):
                 pca_rows.append({"selection_id": sid, "component": j + 1,
@@ -273,10 +258,139 @@ def fit_selected(train: Split, selected: pd.DataFrame, c: dict, out: Path) -> di
             "warning": "仅加载可信的joblib文件。此模型输入是561维官方特征，不是原始传感器序列。",
         })
     save_table(fit_rows, out / "tables/final_fit_and_size.csv")
-    save_table(features, out / "tables/selected_features.csv")
     save_table(pca_rows, out / "tables/pca_variance.csv")
     return fitted
 
+
+
+# 控制变量补充实验属于开发期时间分析。绝不将测试人员、测试标签或测试分数用于此处。
+CONTROL_SAMPLE_FRACTIONS = (0.25, 0.50, 0.75, 1.00)
+CONTROL_FIT_REPEATS = 3
+
+
+def controlled_fit_costs(train: Split, selected: pd.DataFrame, c: dict, out: Path,
+                         *, repeats: int = CONTROL_FIT_REPEATS) -> None:
+    """固定各模型的全特征CV最优超参数，分析样本规模/主成分维数对分类器fit的影响。
+
+    1) 样本量：每组独立拟合标准化和128维PCA，比较561维全特征与PCA128的分类器fit；
+    2) 维数：固定全部7352个训练窗口，同一份PCA128基底截取32/64/96/128列；
+    标准化、PCA的预计算不计入本函数中的classifier.fit耗时，正式最终训练阶段另有分解。
+    """
+    if repeats < 1:
+        raise ValueError('控制变量计时重复次数必须大于0。')
+    n = int(len(train.y))
+    if n <= 0 or n != train.X.shape[0] or n != len(train.subjects):
+        raise ValueError('控制变量实验训练数据不完整。')
+    full_rows = selected[selected.method == 'full']
+    if set(full_rows.model) != set(c['models']) or full_rows.model.duplicated().any():
+        raise ValueError('缺少模型的全特征锁定参数，不能进行固定超参数控制变量实验。')
+    dims = sorted(set(int(k) for k in c['dimensions']))
+    if not dims or dims[-1] >= train.X.shape[1]:
+        raise ValueError('控制变量PCA维数越界。')
+    if round(n * CONTROL_SAMPLE_FRACTIONS[0]) <= dims[-1]:
+        raise ValueError('最小样本子集不足以拟合所需的PCA维数。')
+
+    # 将同一人员/活动中的样本随机打乱后按相对位置交错排序。每一级样本集合严格嵌套，
+    # 每个人员与类别在各比例中尽量接近原有分布，不引入测试集。
+    rng = np.random.default_rng(c['seed'])
+    ranks = np.empty(n, dtype=np.float64)
+    for subject in np.unique(train.subjects):
+        for activity in np.unique(train.y):
+            ids = np.flatnonzero((train.subjects == subject) & (train.y == activity))
+            if not len(ids):
+                continue
+            shuffled = rng.permutation(ids)
+            ranks[shuffled] = (np.arange(len(ids)) + rng.uniform(0, 1, len(ids))) / len(ids)
+    order = np.argsort(ranks, kind='stable')
+    n_by_fraction = {float(f): int(round(n * f)) for f in CONTROL_SAMPLE_FRACTIONS}
+    if n_by_fraction[1.0] != n:
+        raise AssertionError('100%样本子集应该覆盖全部官方训练集。')
+
+    prepared = {}
+    input_hashes = {}
+    with threadpool_limits(limits=1):
+        for fraction in CONTROL_SAMPLE_FRACTIONS:
+            indices = np.asarray(order[:n_by_fraction[fraction]], dtype=np.int64)
+            labels = np.asarray(train.y[indices])
+            scaler = StandardScaler()
+            X_full = np.ascontiguousarray(scaler.fit_transform(train.X[indices]))
+            X_pca = np.ascontiguousarray(PCA(n_components=dims[-1], svd_solver='full',
+                                            whiten=False).fit_transform(X_full))
+            prepared[float(fraction)] = (X_full, X_pca, labels)
+            input_hashes[str(fraction)] = hashlib.sha256(indices.tobytes()).hexdigest()
+
+        # PCA特征嵌套，共享100%训练集下同一次SVD，比较固定样本量下输入维数。
+        tasks = []
+        for model in c['models']:
+            row = full_rows[full_rows.model == model].iloc[0]
+            parameters = json.loads(row.params_json)
+            clean_params = {name.removeprefix('model__'): value for name, value in parameters.items()}
+            for fraction in CONTROL_SAMPLE_FRACTIONS:
+                for method, k in (('full', int(train.X.shape[1])), ('pca', dims[-1])):
+                    tasks.append((model, 'sample_size', method, int(k), float(fraction),
+                                  clean_params, row.params_json))
+            for k in dims:
+                tasks.append((model, 'input_dimension', 'pca', int(k), 1.0,
+                              clean_params, row.params_json))
+
+        # 每轮打乱任务顺序，以免时间趋势总是偏向同一个模型；每项都重新创建分类器。
+        results = []
+        schedule_rng = np.random.default_rng(c['seed'] + 104729)
+        started = time.perf_counter()
+        for repeat in range(repeats):
+            for j in schedule_rng.permutation(len(tasks)):
+                model, experiment, method, k, fraction, params, params_json = tasks[int(j)]
+                X_full, X_pca, y = prepared[fraction]
+                if method == 'full':
+                    features = X_full
+                else:
+                    features = np.ascontiguousarray(X_pca[:, :k])
+                clf = make_classifier(model, c)
+                clf.set_params(**params)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter('always')
+                    start = time.perf_counter()
+                    clf.fit(features, y)
+                    elapsed = time.perf_counter() - start
+                results.append({
+                    'model': model, 'experiment': experiment,
+                    'method': method, 'k': k, 'sample_fraction': fraction,
+                    'train_n': len(y), 'repeat': repeat,
+                    'classifier_fit_seconds': elapsed,
+                    'warning_count': len(caught), 'params_json': params_json,
+                })
+            print(f'[Control] classifier.fit timing repetition {repeat+1}/{repeats} complete', flush=True)
+
+    raw = save_table(results, out / 'tables/controlled_fit_timing_raw.csv')
+    summary = (raw.groupby(['model', 'experiment', 'method', 'k', 'sample_fraction',
+                            'train_n', 'params_json'], as_index=False)
+                  .agg(repeats=('repeat', 'count'),
+                       median_fit_seconds=('classifier_fit_seconds', 'median'),
+                       q25_fit_seconds=('classifier_fit_seconds', lambda v: float(np.quantile(v, .25))),
+                       q75_fit_seconds=('classifier_fit_seconds', lambda v: float(np.quantile(v, .75))),
+                       warning_count=('warning_count', 'sum')))
+    if len(summary) != len(tasks) or (summary.repeats != repeats).any():
+        raise AssertionError('控制变量计时数量不完整。')
+    save_table(summary, out / 'tables/controlled_fit_timing_summary.csv')
+    dump_json(out / 'controlled_fit_protocol.json', {
+        'source': 'official UCI HAR training partition only',
+        'test_data_used': False,
+        'training_n': n,
+        'train_subject_count': int(len(np.unique(train.subjects))),
+        'seed': c['seed'], 'repeats': repeats,
+        'sample_fractions': list(CONTROL_SAMPLE_FRACTIONS),
+        'sample_sizes': n_by_fraction,
+        'nested_subset_indices_sha256': input_hashes,
+        'sample_stratification': 'subject and activity, approximate proportions, nested',
+        'dimension_candidates': dims,
+        'fixed_hyperparameters': 'each classifier full-feature selected CV parameters; do not retune',
+        'sample_size_experiment': 'full 561 and PCA max-dimension representation; PCA fitted on each training subset',
+        'dimension_experiment': 'full official training set; single PCA fit at max(dimensions), nested leading components',
+        'timed_scope': 'classifier.fit only; excludes scaling, PCA, feature construction, data loading, prediction, and CV search',
+        'threadpool_limit': 1, 'wall_seconds_for_control_addon': time.perf_counter() - started,
+        'n_tasks_per_repeat': len(tasks), 'n_fit_calls': len(results),
+        'interpretation': 'training computational-cost diagnostic; no new classification accuracy or significance result',
+    })
 
 def evaluate_test(test: Split, fitted: dict, selected: pd.DataFrame, out: Path) -> None:
     overall, per_subject, per_class, predictions = [], [], [], []
@@ -317,7 +431,7 @@ def paired_subject_bootstrap(out: Path, c: dict) -> None:
     rows = []
     for model in c["models"]:
         baseline = subjects[subjects.selection_id == f"{model}__full"].set_index("subject").sort_index()
-        for method in ("pca", "anova"):
+        for method in METHODS[1:]:
             other = subjects[subjects.selection_id == f"{model}__{method}"].set_index("subject").reindex(baseline.index)
             delta = other.macro_f1.to_numpy() - baseline.macro_f1.to_numpy()
             rng = np.random.default_rng(c["seed"])

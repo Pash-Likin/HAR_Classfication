@@ -1,6 +1,7 @@
 """简洁图表、色带和标签回归测试；夹具不作为实验结果。"""
 import sys
 import unittest
+import warnings
 from pathlib import Path
 import json
 import numpy as np
@@ -8,7 +9,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from har_study.plots import (check_layout, configure_font, canvas, confusion_figure,
-                            heatmap_cells, parameter_figure, _sorted, MODEL_ORDER)
+                            confusion_comparison_figure, heatmap_cells,
+                            parameter_figure, compression_figure, _sorted, MODEL_ORDER)
 import matplotlib.pyplot as plt
 
 class VisualTests(unittest.TestCase):
@@ -37,6 +39,39 @@ class VisualTests(unittest.TestCase):
     def test_shared_count_color_range(self):
         fig = confusion_figure(np.eye(6), 'Test', vmax=500)
         self.assertEqual(fig.axes[0].images[0].get_clim(), (0., 500.))
+    def test_two_panel_pca_comparison(self):
+        counts = {'full': np.eye(6, dtype=int) * 30,
+                  'pca': np.eye(6, dtype=int) * 25}
+        fig = confusion_comparison_figure(counts, 'KNN', {'full': 561, 'pca': 64}, vmax=40)
+        self.assertEqual(len(fig.axes), 3)  # 两幅矩阵和一个共享色标。
+        for ax, method in zip(fig.axes[:2], ('full', 'pca')):
+            np.testing.assert_array_equal(ax.images[0].get_array(), counts[method])
+            self.assertEqual(ax.images[0].get_clim(), (0., 40.))
+            self.assertEqual(len(ax.texts), 36)
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='Glyph .* missing from font')
+            self.assertEqual(check_layout(fig), [])
+    def test_legacy_third_method_not_silently_drawn(self):
+        counts = {name: np.eye(6, dtype=int) for name in ('full', 'pca', 'anova')}
+        with self.assertRaises(ValueError):
+            confusion_comparison_figure(counts, 'KNN', {'full': 561, 'pca': 64, 'anova': 64})
+    def test_dimension_curve_marks_highest_cv_selection(self):
+        dimensions = [32, 64, 96, 128]
+        curve = pd.DataFrame([
+            dict(model='KNN', method='full', k=561, cv_macro_f1=.94, cv_macro_f1_std=.01),
+            *[dict(model='KNN', method='pca', k=k, cv_macro_f1=score, cv_macro_f1_std=.01)
+              for k, score in zip(dimensions, [.88, .90, .91, .92])],
+        ])
+        fig = compression_figure(curve, 'KNN', dimensions, {'k': 128, 'cv_macro_f1': .92})
+        ax = fig.axes[0]
+        np.testing.assert_array_equal(ax.get_xticks(), dimensions)
+        labels = [text.get_text() for text in ax.get_legend().get_texts()]
+        self.assertIn('最高验证分数（128维）', labels)
+        self.assertIn('全特征基准', labels)
+        self.assertFalse(any('容忍' in text for text in labels))
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='Glyph .* missing from font')
+            self.assertEqual(check_layout(fig), [])
     def test_fisher_parameter_heatmap(self):
         config = json.loads((ROOT/'config.json').read_text())
         df=pd.DataFrame([{'params_json':'{"model__shrinkage":null}', 'cv_macro_f1':.91},

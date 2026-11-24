@@ -45,7 +45,7 @@ def fixed_parameter_curves(candidates: pd.DataFrame, config: dict, out: Path):
 
 
 def derive_decisions(out: Path):
-    """不删除失败方案；以同一个分类器的full作为压缩代价的参照。"""
+    """保留锁定方案的完整表现；以同一分类器的full作描述性参照，不重新选维数。"""
     from .audit import decision_summary
     from .study import save_table
     out = Path(out)

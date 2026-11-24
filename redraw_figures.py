@@ -1,4 +1,4 @@
-"""重画已经完成的结果，不训练、不改变模型选择。"""
+"""重画已经完成的full/PCA新结果，不训练；旧ANOVA快照需使用原版代码。"""
 from pathlib import Path
 import argparse
 import sys

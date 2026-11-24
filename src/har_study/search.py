@@ -17,7 +17,6 @@ import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.model_selection import ParameterGrid
 from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
@@ -36,15 +35,9 @@ def prepare_fold(data, train, validation, max_k: int, folder: Path):
     pca = PCA(n_components=max_k, svd_solver="full", whiten=False)
     pc_train = pca.fit_transform(X_train)
     pc_valid = pca.transform(X_valid)
-    selector = SelectKBest(f_classif, k="all").fit(X_train, data.y[train])
-    # 与SelectKBest相同的稳定排序及NaN处理。选择后的列按原始列序返回。
-    scores = np.asarray(selector.scores_).copy()
-    scores[np.isnan(scores)] = np.finfo(scores.dtype).min
-    ranking = np.argsort(scores, kind="mergesort")
     for name, value in (("train_scaled", X_train), ("valid_scaled", X_valid),
                         ("train_pca", pc_train), ("valid_pca", pc_valid),
-                        ("y_train", data.y[train]), ("y_valid", data.y[validation]),
-                        ("anova_ranking", ranking)):
+                        ("y_train", data.y[train]), ("y_valid", data.y[validation])):
         np.save(folder / f"{name}.npy", np.ascontiguousarray(value))
     return {"train_n": len(train), "validation_n": len(validation),
             "train_subjects": sorted(map(int, np.unique(data.subjects[train]))),
@@ -54,16 +47,17 @@ def prepare_fold(data, train, validation, max_k: int, folder: Path):
 
 
 def representation(folder: Path, method: str, k: int):
+    if method not in ("full", "pca"):
+        raise ValueError(f"当前实验不支持特征方法：{method}")
     prefix = "pca" if method == "pca" else "scaled"
     train = np.load(folder / f"train_{prefix}.npy", mmap_mode="r")
     valid = np.load(folder / f"valid_{prefix}.npy", mmap_mode="r")
+    if not isinstance(k, (int, np.integer)) or k < 1 or k > train.shape[1]:
+        raise ValueError("请求维数超出已拟合的折内表示范围。")
     if method == "pca":
         train, valid = train[:, :k], valid[:, :k]
-    elif method == "anova":
-        indices = np.sort(np.load(folder / "anova_ranking.npy")[-k:])
-        train, valid = train[:, indices], valid[:, indices]
-    elif method != "full":
-        raise ValueError(method)
+    elif k != train.shape[1]:
+        raise ValueError("full基准必须保留全部输入维数。")
     return (np.ascontiguousarray(train), np.ascontiguousarray(valid),
             np.load(folder / "y_train.npy"), np.load(folder / "y_valid.npy"))
 
@@ -114,7 +108,7 @@ def cached_grid_search(data, config, folds, out, workers, cache):
         with threadpool_limits(limits=1):
             record = prepare_fold(data, train, valid, max(config["dimensions"]), cache / f"fold_{fold_id}")
         preparation.append({"fold": fold_id, **record})
-        print(f"[Prepare] fold={fold_id+1}/{len(folds)}: shared scale/PCA/ANOVA ready", flush=True)
+        print(f"[Prepare] fold={fold_id+1}/{len(folds)}: shared scale/PCA ready", flush=True)
     dump_json(out / "fold_transform_audit.json", preparation)
     specs = candidate_grid(data, config)
     total = len(specs) * len(folds)
@@ -147,9 +141,9 @@ def cached_grid_search(data, config, folds, out, workers, cache):
     candidates = save_table(summaries, out / "tables/cv_candidates.csv")
     save_table(scores, out / "tables/cv_folds.csv")
     dump_json(out / "search_engine.json", {
-        "engine": "shared_fold_transform_exact_grid_v1", "n_candidates": len(specs),
+        "engine": "shared_fold_transform_pca_exact_grid_v2", "n_candidates": len(specs),
         "actual_classifier_fits": total, "scaler_fits": len(folds), "pca_full_svd_fits": len(folds),
-        "anova_score_fits": len(folds), "search_wall_seconds_excluding_transform": time.perf_counter()-t0,
+        "search_wall_seconds_excluding_transform": time.perf_counter()-t0,
         "warning_count": int(scores.warning_count.sum()),
         "timing_scope": "CV fit秒数仅是分类器拟合，不含共享预处理，不能冒充整条管线训练时间。",
         "complete_at_utc": datetime.now(timezone.utc).isoformat(),

@@ -131,7 +131,7 @@ def benchmark_stages(run_dir: Path, X_test: np.ndarray, models: dict,
                     for _ in range(config["warmups"]):
                         fn()
             # 对照Notebook的顺序测量，额外随机交错模型与阶段，减轻执行时间漂移。
-            # 每个模型和每个阶段仍按同样口径执行15次，不与网格搜索并行。
+            # 每个模型和每个阶段按同样的repeats执行，不与网格搜索并行。
             for rep in range(config["repeats"]):
                 for sid in rng.permutation(sorted(functions)):
                     funcs = functions[sid]
@@ -205,7 +205,7 @@ def build_comparison(run_dir: Path) -> pd.DataFrame:
             rows.append({"model": model, "batch_size": int(size), "pca_k": int(b.k),
                 "full_macro_f1": float(a.macro_f1), "pca_macro_f1": float(b.macro_f1),
                 "pca_delta_macro_f1_pp": float((b.macro_f1 - a.macro_f1) * 100),
-                "meets_cv_tolerance": bool(selected.loc[pca, "meets_cv_tolerance"]),
+                "selection_rule": selected.loc[pca, "selection_rule"],
                 "full_whole_ms_per_window": ta, "pca_whole_ms_per_window": tb,
                 "pca_speedup_full_div_pca": ta / tb,
                 "pca_projection_ms_per_window": value(pca, "reduce"),
@@ -279,7 +279,7 @@ def verify_stage_timing(run_dir: Path, *, strict: bool = True) -> dict:
 
 def draw_stage_figures(run_dir: Path, font_path=None) -> list[Path]:
     """Notebook新增图移入项目；五模型各独立出图，不使用多子图挤压文字。"""
-    from .plots import configure_font
+    from .plots import configure_font, METHODS, METHOD_CN, save
     import matplotlib.pyplot as plt
     from matplotlib.ticker import ScalarFormatter
     run_dir = Path(run_dir)
@@ -289,20 +289,22 @@ def draw_stage_figures(run_dir: Path, font_path=None) -> list[Path]:
     selected = pd.read_csv(run_dir / "tables/selected_configs.csv")
     folder = run_dir / "figures/stage_timing"
     folder.mkdir(parents=True, exist_ok=True)
-    names = {"scale": "标准化", "reduce": "压缩变换", "classifier": "分类预测", "whole": "完整预测"}
-    method_names = {"full": "全特征", "pca": "PCA", "anova": "ANOVA"}
+    names = {"scale": "标准化", "reduce": "PCA变换", "classifier": "分类预测", "whole": "完整预测"}
     paths = []
     for model in dict.fromkeys(selected.model):
+        methods = selected.loc[selected.model == model, "method"]
+        if set(methods) != set(METHODS) or methods.duplicated().any():
+            raise ValueError(f"{model}必须恰好包含full和pca两种特征方案。")
         size = int(summary.batch_size.max())
         sub = summary[(summary.batch_size == size) & summary.selection_id.str.startswith(model + "__")]
         fig, ax = plt.subplots(figsize=(10.5, 5.9))
         fig.subplots_adjust(left=.13, right=.97, top=.88, bottom=.22)
-        xx, width = np.arange(3), .18
+        xx, width = np.arange(len(METHODS)), .18
         for j, stage in enumerate(STAGES):
             vals = [float(sub[(sub.selection_id == model + "__" + method) & (sub.stage == stage)].ms_per_window.iloc[0]) * 1000
-                    for method in ("full", "pca", "anova")]
+                    for method in METHODS]
             ax.bar(xx + (j - 1.5) * width, vals, width, label=names[stage])
-        ax.set_xticks(xx, [method_names[m] for m in ("full", "pca", "anova")])
+        ax.set_xticks(xx, [METHOD_CN[m] for m in METHODS])
         ax.set_xlabel("特征方案")
         ax.set_ylabel("平均每窗口耗时（微秒）")
         ax.set_title(f"{model}：预测耗时分解（批量 {size}）", pad=12)
@@ -312,28 +314,29 @@ def draw_stage_figures(run_dir: Path, font_path=None) -> list[Path]:
         ax.spines["left"].set_visible(True); ax.spines["bottom"].set_visible(True)
         ax.tick_params(length=4, width=1)
         path = folder / f"{model}_stage_timing.png"
-        fig.savefig(path, dpi=300); plt.close(fig); paths.append(path)
+        save(fig, path); paths.append(path)
 
         fig, ax = plt.subplots(figsize=(9.5, 5.9))
         fig.subplots_adjust(left=.14, right=.96, top=.88, bottom=.22)
-        for method, marker in (("full", "o"), ("pca", "s"), ("anova", "^")):
+        for method, marker in (("full", "o"), ("pca", "s")):
             vals = summary[(summary.selection_id == model + "__" + method) & (summary.stage == "whole")].sort_values("batch_size")
-            ax.plot(vals.batch_size, vals.ms_per_window * 1000, marker=marker, label=method_names[method])
+            ax.plot(vals.batch_size, vals.ms_per_window * 1000, marker=marker, label=METHOD_CN[method])
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xticks(sorted(summary.batch_size.unique()))
         ax.xaxis.set_major_formatter(ScalarFormatter())
         ax.set_xlabel("一次预测的窗口数")
         ax.set_ylabel("平均每窗口耗时（微秒，对数刻度）")
         ax.set_title(f"{model}：预测批量与耗时", pad=12)
-        ax.legend(frameon=False, ncol=3, loc="upper center", bbox_to_anchor=(.5, -.16))
+        ax.legend(frameon=False, ncol=len(METHODS), loc="upper center", bbox_to_anchor=(.5, -.16))
         ax.grid(alpha=.17); ax.set_axisbelow(True)
         ax.spines["left"].set_visible(True); ax.spines["bottom"].set_visible(True)
         ax.tick_params(length=4, width=1)
         path = folder / f"{model}_batch_size_comparison.png"
-        fig.savefig(path, dpi=300); plt.close(fig); paths.append(path)
+        save(fig, path); paths.append(path)
     _json(run_dir / "stage_figure_manifest.json", {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_sha256": _sha(run_dir / "tables/stage_timing_summary.csv"),
+        "methods": list(METHODS),
         "files": [str(p.relative_to(run_dir)) for p in paths],
         "note": "独立阶段中位数不可严格求和；full无reduce；B=1仅固定测试窗口。说明放记录而非图下。"})
     return paths

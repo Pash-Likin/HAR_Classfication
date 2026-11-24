@@ -20,8 +20,8 @@ from sklearn.metrics import confusion_matrix
 DPI = 300
 ACTIVITY_CN = ["行走", "上楼", "下楼", "坐", "站立", "躺卧"]
 MODEL_ORDER = ("RBF_SVM", "RandomForest", "LogisticRegression", "KNN", "FisherLDA")
-METHODS = ("full", "pca", "anova")
-METHOD_CN = {"full": "全特征", "pca": "PCA", "anova": "ANOVA"}
+METHODS = ("full", "pca")
+METHOD_CN = {"full": "全特征", "pca": "PCA"}
 CM_CMAP = "Blues"
 
 def configure_font(font_path: str | Path | None = None):
@@ -121,7 +121,7 @@ def _label(row):
 
 def _sorted(frame, models):
     copy = frame.copy()
-    copy["_order"] = [models.index(m) * 3 + METHODS.index(t) for m, t in zip(copy.model, copy.method)]
+    copy["_order"] = [models.index(m) * len(METHODS) + METHODS.index(t) for m, t in zip(copy.model, copy.method)]
     return copy.sort_values("_order").drop(columns="_order").reset_index(drop=True)
 
 
@@ -151,9 +151,9 @@ def confusion_figure(counts, title, *, vmax=None):
 
 
 def confusion_comparison_figure(matrices, model, dimensions, *, vmax=None):
-    """同一分类器的全特征/PCA/ANOVA按固定次序横排，共享计数色标。"""
+    """同一分类器的全特征/PCA按固定次序横排，共享计数色标。"""
     if set(matrices) != set(METHODS) or set(dimensions) != set(METHODS):
-        raise ValueError("每个模型必须同时包含full、pca、anova三种特征方案。")
+        raise ValueError("每个模型必须恰好包含full和pca两种特征方案。")
     values = {method: np.asarray(matrices[method]) for method in METHODS}
     for method, counts in values.items():
         if counts.shape != (6, 6) or not np.isfinite(counts).all() or (counts < 0).any():
@@ -164,9 +164,9 @@ def confusion_comparison_figure(matrices, model, dimensions, *, vmax=None):
         vmax = max(float(counts.max()) for counts in values.values())
     vmax = max(1, float(vmax))
 
-    fig, axes = plt.subplots(1, 3, figsize=(18.0, 6.3), sharey=True)
+    fig, axes = plt.subplots(1, len(METHODS), figsize=(12.8, 6.3), sharey=True)
     fig.subplots_adjust(left=.076, right=.886, bottom=.19, top=.84, wspace=.18)
-    fig.suptitle(f"{model}：三种特征处理的混淆矩阵", y=.96,
+    fig.suptitle(f"{model}：全特征与PCA的混淆矩阵", y=.96,
                  fontsize=16, fontweight="bold")
     for col, method in enumerate(METHODS):
         ax = axes[col]
@@ -187,7 +187,7 @@ def confusion_comparison_figure(matrices, model, dimensions, *, vmax=None):
         ax.grid(False)
     axes[0].set_ylabel("真实活动", labelpad=12)
     fig.supxlabel("预测活动", y=.075, fontsize=12)
-    # 三图共用一条色标，且所有五个模型都使用相同的vmax。
+    # 两图共用一条色标，且所有五个模型都使用相同的vmax。
     cb_ax = fig.add_axes([.907, .235, .016, .53])
     bar = fig.colorbar(image, cax=cb_ax)
     bar.set_label("样本数", labelpad=10)
@@ -258,6 +258,210 @@ def parameter_figure(values, ynames, xnames, ylabel, xlabel, title):
     return fig
 
 
+def compression_figure(curve, model, dimensions, selected_pca):
+    """显示各维数调参后的验证表现，并标出已锁定的最高分PCA维度。"""
+    sub = curve[curve.model == model]
+    baseline = float(sub[sub.method == "full"].cv_macro_f1.iloc[0]) * 100
+    rows = sub[sub.method == "pca"].sort_values("k")
+    fig, ax = canvas(f"{model}：维数与验证表现", size=(10.2, 6.4), top=.76)
+    ax.errorbar(rows.k, rows.cv_macro_f1 * 100, yerr=rows.cv_macro_f1_std * 100,
+                marker="o", capsize=3, linewidth=1.6, label="PCA")
+    ax.axhline(baseline, linestyle="--", linewidth=1.1, label="全特征基准")
+    chosen_k = int(selected_pca["k"])
+    ax.scatter([chosen_k], [float(selected_pca["cv_macro_f1"]) * 100], marker="*",
+               s=150, zorder=5, label=f"最高验证分数（{chosen_k}维）")
+    lower = list((rows.cv_macro_f1 - rows.cv_macro_f1_std) * 100)
+    upper = list((rows.cv_macro_f1 + rows.cv_macro_f1_std) * 100)
+    ax.set_xticks(dimensions)
+    ax.set_ylim(max(0, np.floor(min(lower + [baseline]) - 1)),
+                min(101, np.ceil(max(upper + [baseline]) + 1)))
+    ax.set_xlabel("维数"); ax.set_ylabel("验证 Macro-F1（%）")
+    ax.legend(frameon=False, ncol=2, loc="lower left", bbox_to_anchor=(0, 1.015), fontsize=10)
+    ax.grid(alpha=.18)
+    return fig
+
+
+
+def draw_training_cost_figures(run: Path, selected: pd.DataFrame, candidates: pd.DataFrame,
+                               final_fit: pd.DataFrame, finish) -> None:
+    """每模型一张左右双栏分组柱状图：CV搜索（任务累计）与最终训练（实测）。
+
+    左侧仅比较全特征与最终选定PCA维数的CV训练+预测，完整维数搜索仍照常执行；右侧训练用全部官方训练样本拟合一次。
+    两侧坐标轴独立；CV左侧不含折内共享标准化/PCA缓存与进程调度，不能与右侧相加。
+    """
+    path = run / 'tables' / 'cv_folds.csv'
+    if not path.is_file():
+        return
+    cv = pd.read_csv(path)
+    required = {'candidate_id', 'classifier_fit_seconds', 'classifier_predict_seconds'}
+    if not required <= set(cv.columns):
+        raise ValueError(f'CV耗时数据缺少字段：{sorted(required - set(cv.columns))}')
+    if candidates.candidate_id.duplicated().any():
+        raise ValueError('CV候选编号重复，无法计算搜索耗时。')
+    cv = cv.merge(candidates[['candidate_id', 'model', 'method', 'k']],
+                  on='candidate_id', how='left', validate='many_to_one')
+    if cv[['model','method','k']].isna().any().any():
+        raise ValueError('CV记录存在无匹配候选的任务。')
+    stages = {'scale_fit_seconds', 'reduce_fit_seconds', 'classifier_fit_seconds',
+              'final_fit_seconds', 'final_fit_n_samples'}
+    has_final = stages <= set(final_fit.columns)
+    title = {'RBF_SVM':'SVM', 'RandomForest':'RandomForest',
+             'LogisticRegression':'LogisticRegression', 'KNN':'KNN',
+             'FisherLDA':'FisherLDA'}
+
+    def grouped(ax, labels, series, *, ylabel):
+        x = np.arange(len(labels), dtype=float)
+        w = min(.21, .82 / len(series))
+        for i, (name, values) in enumerate(series):
+            offset = (i - (len(series)-1)/2)*w
+            bars = ax.bar(x+offset, np.asarray(values,dtype=float), width=w*.92, label=name)
+            for bar, v in zip(bars, values):
+                if v >= 0.05:   # 避免微小计时标签相互遮挡
+                    ax.text(bar.get_x()+bar.get_width()/2, bar.get_height(), f'{v:.2f}',
+                            ha='center', va='bottom', fontsize=8, rotation=0)
+        max_value = max(float(v) for _, values in series for v in values)
+        ax.set_xlim(-.60, len(labels)-.40)
+        ax.set_ylim(0, max(max_value*1.22, .005))
+        ax.set_xticks(x, labels)
+        ax.set_ylabel(ylabel)
+        ax.grid(axis='y', alpha=.17)
+        ax.set_axisbelow(True)
+        ax.tick_params(axis='x', labelsize=10)
+
+    for model in MODEL_ORDER:
+        rows = selected[selected.model == model]
+        if set(rows.method) != set(METHODS) or len(rows) != 2:
+            continue
+        full, pca = (rows[rows.method == m].iloc[0] for m in METHODS)
+        # 只展示最终选定的PCA维数（本轮为128维）的CV耗时。
+        # 其他维数仍参与原始调参和维数选择，但不计入这张对比图。
+        chosen_k = int(pca.k)
+        cv_rows = {
+            'full': cv[(cv.model == model) & (cv.method == 'full')],
+            'pca': cv[(cv.model == model) & (cv.method == 'pca') & (cv.k == chosen_k)],
+        }
+        counts = {
+            'full': len(candidates[(candidates.model == model) & (candidates.method == 'full')]),
+            'pca': len(candidates[(candidates.model == model) & (candidates.method == 'pca') & (candidates.k == chosen_k)]),
+        }
+        if any(len(cv_rows[m]) == 0 or len(cv_rows[m]) % counts[m] for m in METHODS):
+            raise ValueError(f'{model}的CV任务数与候选参数组数不符。')
+        cv_series = [
+            ('模型拟合累计', [float(cv_rows[m].classifier_fit_seconds.sum()) for m in METHODS]),
+            ('验证预测累计', [float(cv_rows[m].classifier_predict_seconds.sum()) for m in METHODS]),
+            ('已记录两项合计', [float((cv_rows[m].classifier_fit_seconds+
+                                  cv_rows[m].classifier_predict_seconds).sum()) for m in METHODS]),
+        ]
+        cv_labels = [f'全特征\n{counts["full"]}组×{len(cv_rows["full"])//counts["full"]}折={len(cv_rows["full"])}次',
+                     f'PCA{chosen_k}维\n{counts["pca"]}组×{len(cv_rows["pca"])//counts["pca"]}折={len(cv_rows["pca"])}次']
+        # 显式换行，而不是将字符串中的换行转义作为显示文字。
+        cv_labels = [name.replace('\\n','\n') for name in cv_labels]
+        if has_final:
+            fits = final_fit.set_index('selection_id')
+            left_rows = [fits.loc[full.selection_id], fits.loc[pca.selection_id]]
+            for r in left_rows:
+                for field in stages:
+                    if not np.isfinite(float(r[field])) or float(r[field]) < 0:
+                        raise ValueError(f'{model}的最终训练时间字段{field}非法。')
+            train_series = [
+                ('标准化', [float(r.scale_fit_seconds) for r in left_rows]),
+                ('PCA拟合变换', [float(r.reduce_fit_seconds) for r in left_rows]),
+                ('分类器拟合', [float(r.classifier_fit_seconds) for r in left_rows]),
+                ('完整训练', [float(r.final_fit_seconds) for r in left_rows]),
+            ]
+            fig,(ax_left,ax_right)=plt.subplots(1,2,figsize=(15.4,6.8))
+            fig.subplots_adjust(left=.075,right=.985,bottom=.22,top=.76,wspace=.28)
+            fig.suptitle(f'{title[model]}：五折CV调参与最终训练耗时',
+                         y=.98, fontsize=17, fontweight='bold')
+            grouped(ax_left,cv_labels,cv_series,ylabel='CV任务累计耗时（秒）')
+            grouped(ax_right,['全特征561维',f'PCA{int(pca.k)}维'],train_series,ylabel='一次训练耗时（秒）')
+            ax_left.set_title(f'① 五折CV：全特征与PCA{chosen_k}维', fontsize=12, pad=12)
+            ax_right.set_title('② 最终训练：全部训练样本', fontsize=12, pad=12)
+            ax_left.set_xlabel('相同超参数网格的五折CV',labelpad=10)
+            ax_right.set_xlabel('训练方案',labelpad=10)
+            # 图例置于各自子图的上方，两个部分独立刻度，不把CV时间与最终训练时间相加。
+            ax_left.legend(frameon=False,ncol=2,fontsize=9.2,loc='lower left',bbox_to_anchor=(0,1.12))
+            ax_right.legend(frameon=False,ncol=2,fontsize=9.2,loc='lower left',bbox_to_anchor=(0,1.12))
+            finish(fig,f'training_cost/combined_{model}.png')
+        else:
+            fig,ax=canvas(f'{title[model]}：五折CV与调参已记录耗时（旧数据）',
+                           size=(11.3,6.2),left=.12,right=.96,bottom=.21,top=.77)
+            grouped(ax,cv_labels,cv_series,ylabel='CV任务累计耗时（秒）')
+            ax.legend(frameon=False,ncol=3,fontsize=9,loc='lower left',bbox_to_anchor=(0,1.03))
+            finish(fig,f'training_cost/cv_{model}.png')
+
+
+def draw_controlled_fit_figures(run: Path, selected: pd.DataFrame, finish) -> None:
+    """控制变量的每模型两张柱状图；数据只取官方训练集的重复fit计时。"""
+    path = run / 'tables' / 'controlled_fit_timing_summary.csv'
+    if not path.exists():
+        return  # 对旧实验只重画已有图，不编造未执行的控制变量结果。
+    data = pd.read_csv(path)
+    required = {'model','experiment','method','k','sample_fraction','train_n',
+                'median_fit_seconds','q25_fit_seconds','q75_fit_seconds','repeats'}
+    if not required <= set(data):
+        raise ValueError(f'控制变量结果缺少字段：{sorted(required-set(data))}')
+    titles = {'RBF_SVM':'SVM','RandomForest':'RandomForest',
+              'LogisticRegression':'LogisticRegression','KNN':'KNN','FisherLDA':'FisherLDA'}
+
+    for model in MODEL_ORDER:
+        if model not in set(data.model):
+            continue
+        group = data[data.model==model]
+        sample = group[group.experiment=='sample_size']
+        fractions = [0.25,0.50,0.75,1.00]
+        if len(sample) != 2*len(fractions) or set(sample.method) != {'full','pca'}:
+            raise ValueError(f'{model}样本量控制变量结果不完整。')
+        fig,ax=canvas(f'{titles[model]}：训练样本量对分类器拟合时间的影响',
+                      size=(10.7,6.3),left=.14,right=.96,bottom=.17,top=.78)
+        x=np.arange(len(fractions)); w=.34
+        for i,(method,label) in enumerate((('full','全特征561维'),('pca','PCA128维'))):
+            ordered=[]
+            for frac in fractions:
+                one=sample[(sample.method==method)&(np.isclose(sample.sample_fraction,frac))]
+                if len(one)!=1: raise ValueError(f'{model}/{method}/{frac}重复或缺失。')
+                ordered.append(one.iloc[0])
+            vals=np.array([r.median_fit_seconds for r in ordered])
+            low=np.array([r.q25_fit_seconds for r in ordered])
+            high=np.array([r.q75_fit_seconds for r in ordered])
+            offset=(i-.5)*w
+            ax.bar(x+offset,vals,width=w*.94,label=label,
+                   yerr=np.vstack([np.maximum(vals-low,0),np.maximum(high-vals,0)]),capsize=3)
+        sizes=[int(sample[np.isclose(sample.sample_fraction,f)].train_n.iloc[0]) for f in fractions]
+        ax.set_xticks(x,[f'{int(f*100)}%\n{n}条' for f,n in zip(fractions,sizes)])
+        ax.set_xlabel('官方训练集抽样比例和样本数')
+        ax.set_ylabel(f'分类器拟合耗时（秒；{int(sample.repeats.iloc[0])}轮中位数与四分位）')
+        ax.grid(axis='y',alpha=.18);ax.set_axisbelow(True)
+        ax.legend(frameon=False,ncol=2,loc='lower left',bbox_to_anchor=(0,1.02))
+        finish(fig,f'training_cost/control_sample_size_{model}.png')
+
+        dims=group[group.experiment=='input_dimension']
+        xs=sorted(int(v) for v in dims.k.unique())
+        if not xs or len(dims)!=len(xs) or len({int(v) for v in dims.train_n})!=1:
+            raise ValueError(f'{model}维数控制变量结果不完整。')
+        series=dims.set_index('k').reindex(xs)
+        if series.median_fit_seconds.isna().any():
+            raise ValueError(f'{model}维数数据不完整。')
+        vals=series.median_fit_seconds.to_numpy(dtype=float)
+        err_lo=np.maximum(vals-series.q25_fit_seconds.to_numpy(dtype=float),0)
+        err_hi=np.maximum(series.q75_fit_seconds.to_numpy(dtype=float)-vals,0)
+        # 可显示561维全特征的训练时间作旁证；32-128维之间才是同一个PCA基底的对照。
+        ref = sample[(sample.method=='full') & (np.isclose(sample.sample_fraction,1.0))]
+        fig,ax=canvas(f'{titles[model]}：固定样本量下的PCA维数与拟合时间',
+                      size=(10.7,6.3),left=.14,right=.96,bottom=.17,top=.78)
+        ax.bar(np.arange(len(xs)),vals,width=.63,label='PCA主成分数',
+               yerr=np.vstack([err_lo,err_hi]),capsize=3)
+        if len(ref)==1:
+            ref_value=float(ref.iloc[0].median_fit_seconds)
+            ax.axhline(ref_value,linestyle='--',linewidth=1.4,
+                       label='全特征561维参照（非同一PCA基底）')
+        ax.set_xticks(np.arange(len(xs)),[str(k) for k in xs])
+        ax.set_xlabel('分类器输入维数（固定全部训练样本，同一PCA基底）')
+        ax.set_ylabel(f'分类器拟合耗时（秒；{int(dims.repeats.iloc[0])}轮中位数与四分位）')
+        ax.grid(axis='y',alpha=.18);ax.set_axisbelow(True)
+        ax.legend(frameon=False,loc='lower left',bbox_to_anchor=(0,1.02),fontsize=9.5)
+        finish(fig,f'training_cost/control_dimension_{model}.png')
+
 def draw_all(run_dir: Path, font_path=None) -> list[Path]:
     """读取已保存结果；不改模型和实验数值，图片脚注全部移至项目说明。"""
     from .verify import verify_run
@@ -269,7 +473,7 @@ def draw_all(run_dir: Path, font_path=None) -> list[Path]:
     audit = json.loads((run / "data_audit.json").read_text(encoding="utf-8"))
     selected, test, curve = read("selected_configs.csv"), read("test_metrics.csv"), read("compression_curve.csv")
     candidates, predictions = read("cv_candidates.csv"), read("test_predictions.csv")
-    subject, protocol = read("test_subjects.csv"), read("protocol_comparison.csv")
+    subject = read("test_subjects.csv")
     timing, sizes = read("timing_summary.csv"), read("final_fit_and_size.csv")
     models = [m for m in MODEL_ORDER if m in set(test.model)]
     if set(models) != set(test.model): raise ValueError("出现未定义模型。")
@@ -295,38 +499,26 @@ def draw_all(run_dir: Path, font_path=None) -> list[Path]:
         ax.grid(axis="y", alpha=.18)
         finish(fig, "overview/01_activity_distribution.png")
 
-        fig, ax = canvas("验证协议比较", size=(11.5, 6.0), left=.25, top=.80)
+        # 只展示按人员分组的训练交叉验证分数；不比较随机窗口协议。
+        fig, ax = canvas("人员分组交叉验证结果", size=(11.5, 6.0), left=.25, top=.80)
         y = np.arange(len(models))
-        for i, (key, label, mark) in enumerate((("subject_grouped", "人员分组", "o"),
-                                               ("random_windows", "随机窗口", "s"))):
-            group = protocol[protocol.protocol == key].groupby("model").macro_f1.agg(["mean", "std"]).reindex(models)
-            ax.errorbar(group["mean"] * 100, y + (i - .5) * .24, xerr=group["std"] * 100,
+        for i, (method, label, mark) in enumerate((("full", "全特征", "o"),
+                                                   ("pca", "PCA最佳维度", "s"))):
+            group = selected[selected.method == method].set_index("model").reindex(models)
+            if group.cv_macro_f1.isna().any() or group.cv_macro_f1_std.isna().any():
+                raise ValueError("人员分组验证结果不完整，不能绘制对比图。")
+            ax.errorbar(group.cv_macro_f1.to_numpy() * 100, y + (i - .5) * .24,
+                        xerr=group.cv_macro_f1_std.to_numpy() * 100,
                         fmt=mark, capsize=3, label=label)
         ax.set_yticks(y, models); ax.invert_yaxis(); ax.set_xlim(60, 102)
-        ax.set_xlabel("固定参数：交叉验证 Macro-F1（%）"); ax.set_ylabel("分类模型")
+        ax.set_xlabel("5折人员分组CV Macro-F1（%；折间标准差）"); ax.set_ylabel("分类模型")
         ax.legend(ncol=2, frameon=False, loc="lower left", bbox_to_anchor=(0, 1.01))
         ax.grid(axis="x", alpha=.18)
-        finish(fig, "overview/02_protocol_comparison.png")
+        finish(fig, "overview/02_subject_grouped_cv.png")
 
         for model in models:
-            sub = curve[curve.model == model]
-            baseline = float(sub[sub.method == "full"].cv_macro_f1.iloc[0]) * 100
-            fig, ax = canvas(f"{model}：维数与验证表现", size=(10.2, 6.4), top=.76)
-            lower, upper = [], []
-            for method, marker in (("pca", "o"), ("anova", "s")):
-                rows = sub[sub.method == method].sort_values("k")
-                ax.errorbar(rows.k, rows.cv_macro_f1 * 100, yerr=rows.cv_macro_f1_std * 100,
-                            marker=marker, capsize=3, linewidth=1.6, label=METHOD_CN[method])
-                lower.extend((rows.cv_macro_f1 - rows.cv_macro_f1_std) * 100)
-                upper.extend((rows.cv_macro_f1 + rows.cv_macro_f1_std) * 100)
-            ax.axhline(baseline, linestyle="--", linewidth=1.1, label="全特征基准")
-            ax.axhline(baseline - config["allowed_macro_f1_drop"] * 100, linestyle=":", linewidth=1.1,
-                       label="验证容忍下限")
-            ax.set_xticks(config["dimensions"])
-            ax.set_ylim(max(0, np.floor(min(lower + [baseline]) - 1)), min(101, np.ceil(max(upper + [baseline]) + 1)))
-            ax.set_xlabel("维数"); ax.set_ylabel("验证 Macro-F1（%）")
-            ax.legend(frameon=False, ncol=2, loc="lower left", bbox_to_anchor=(0, 1.015), fontsize=10)
-            ax.grid(alpha=.18)
+            chosen = selected[(selected.model == model) & (selected.method == "pca")].iloc[0]
+            fig = compression_figure(curve, model, config["dimensions"], chosen)
             finish(fig, f"compression/{model}.png")
 
         fig, ax = canvas("测试集分类表现", size=(12.4, max(7, len(test) * .48 + 2.4)), left=.34, right=.86, top=.84, bottom=.10)
@@ -388,7 +580,7 @@ def draw_all(run_dir: Path, font_path=None) -> list[Path]:
         for model in models:
             grouped = selected[selected.model == model].set_index("method")
             if set(grouped.index) != set(METHODS) or grouped.index.duplicated().any():
-                raise ValueError(f"{model}缺少全特征/PCA/ANOVA中的一个，或存在重复方案。")
+                raise ValueError(f"{model}缺少全特征/PCA中的一个，或存在重复方案。")
             model_matrices = {method: matrices[grouped.loc[method, "selection_id"]] for method in METHODS}
             dims = {method: int(grouped.loc[method, "k"]) for method in METHODS}
             fig = confusion_comparison_figure(model_matrices, model, dims, vmax=vmax)
@@ -400,13 +592,18 @@ def draw_all(run_dir: Path, font_path=None) -> list[Path]:
                         f"{item.model} / {METHOD_CN[item.method]} / {int(item.k)}维")
             finish(fig, f"parameters/parameters_{item.selection_id}.png")
 
+        # 直接复用现有CV逐折记录和最终训练表，不需要外部分析脚本。
+        # 已有旧运行如未记录分阶段最终训练时间，只生成CV耗时图，不伪造旧记录。
+        draw_training_cost_figures(run, selected, candidates, sizes, finish)
+        draw_controlled_fit_figures(run, selected, finish)
+
         # 全部图绘制与边界检查通过后再替换旧图，避免失败时留下半套结果。
         if dest.exists(): shutil.rmtree(dest)
         shutil.copytree(stage, dest)
         info = {"operation": "只重绘，不改训练结果", "created_at_utc": datetime.now(timezone.utc).isoformat(),
                 "font": font, "dpi": DPI, "confusion_colormap": CM_CMAP,
                 "confusion_color_quantity": "原始计数，所有方案共用相同颜色上限",
-                "footnotes_in_images": False, "confusion_layout": "每模型一张，左至右full/pca/anova；共享色标",
+                "footnotes_in_images": False, "confusion_layout": "每模型一张，左至右full/pca；共享色标",
                 "n_figures": len(records), "figures": records,
                 "plot_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
         (run / "visualization_manifest.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")

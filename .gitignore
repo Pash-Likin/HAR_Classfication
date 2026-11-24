@@ -1,7 +1,52 @@
+# Python / test / IDE caches
 __pycache__/
 *.py[cod]
-.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
 .fit_cache/
-data/UCI HAR Dataset/
-data/*.zip
-outputs/
+.plot_build_*/
+.vscode/
+.idea/
+
+# Local Python environments
+.venv/
+venv/
+env/
+
+# Raw data: download locally or restore from the separate local-assets ZIP
+/data/*
+!/data/README.md
+
+# Training creates new runs. Keep only this published result snapshot.
+/outputs/*
+!/outputs/20261027/
+/outputs/20261027/checkpoints/
+
+# Binary models and temporary output
+*.joblib
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.zip
+*.7z
+*.tar
+*.gz
+*.tmp
+*.log
+*.bak
+~$*
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Credentials / private local configuration (do not put keys in tracked files)
+.env
+.env.*
+!.env.example
+*.pem
+*.key

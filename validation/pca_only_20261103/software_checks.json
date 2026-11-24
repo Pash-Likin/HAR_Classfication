@@ -1,0 +1,181 @@
+{
+  "revision": "pca-only-five-models-2.0",
+  "date": "2026-11-03",
+  "status": "PASS",
+  "tests_run": 60,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "environment": {
+    "python": "3.12.14",
+    "numpy": "2.3.5",
+    "pandas": "2.2.3",
+    "scipy": "1.17.0",
+    "sklearn": "1.8.0",
+    "joblib": "1.5.3"
+  },
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+  "plan": {
+    "version": "pca-only-five-models-2.0",
+    "seed": 42,
+    "parameter_sets": {
+      "RBF_SVM": [
+        {
+          "model__C": 1.0,
+          "model__gamma": "scale"
+        },
+        {
+          "model__C": 1.0,
+          "model__gamma": 0.001
+        },
+        {
+          "model__C": 10.0,
+          "model__gamma": "scale"
+        },
+        {
+          "model__C": 10.0,
+          "model__gamma": 0.001
+        },
+        {
+          "model__C": 100.0,
+          "model__gamma": "scale"
+        },
+        {
+          "model__C": 100.0,
+          "model__gamma": 0.001
+        },
+        {
+          "model__C": 1000.0,
+          "model__gamma": "scale"
+        },
+        {
+          "model__C": 1000.0,
+          "model__gamma": 0.001
+        }
+      ],
+      "RandomForest": [
+        {
+          "model__max_depth": null,
+          "model__min_samples_leaf": 1
+        },
+        {
+          "model__max_depth": null,
+          "model__min_samples_leaf": 3
+        },
+        {
+          "model__max_depth": 10,
+          "model__min_samples_leaf": 1
+        },
+        {
+          "model__max_depth": 10,
+          "model__min_samples_leaf": 3
+        },
+        {
+          "model__max_depth": 20,
+          "model__min_samples_leaf": 1
+        },
+        {
+          "model__max_depth": 20,
+          "model__min_samples_leaf": 3
+        }
+      ],
+      "LogisticRegression": [
+        {
+          "model__C": 0.01
+        },
+        {
+          "model__C": 0.1
+        },
+        {
+          "model__C": 1.0
+        },
+        {
+          "model__C": 10.0
+        },
+        {
+          "model__C": 100.0
+        }
+      ],
+      "KNN": [
+        {
+          "model__n_neighbors": 3,
+          "model__weights": "uniform"
+        },
+        {
+          "model__n_neighbors": 3,
+          "model__weights": "distance"
+        },
+        {
+          "model__n_neighbors": 5,
+          "model__weights": "uniform"
+        },
+        {
+          "model__n_neighbors": 5,
+          "model__weights": "distance"
+        },
+        {
+          "model__n_neighbors": 9,
+          "model__weights": "uniform"
+        },
+        {
+          "model__n_neighbors": 9,
+          "model__weights": "distance"
+        },
+        {
+          "model__n_neighbors": 15,
+          "model__weights": "uniform"
+        },
+        {
+          "model__n_neighbors": 15,
+          "model__weights": "distance"
+        }
+      ],
+      "FisherLDA": [
+        {
+          "model__shrinkage": null
+        },
+        {
+          "model__shrinkage": "auto"
+        },
+        {
+          "model__shrinkage": 0.05
+        },
+        {
+          "model__shrinkage": 0.2
+        },
+        {
+          "model__shrinkage": 0.5
+        }
+      ]
+    },
+    "methods": [
+      "full",
+      "pca"
+    ],
+    "pca_dimensions": [
+      32,
+      64,
+      96,
+      128
+    ],
+    "parameter_counts": {
+      "RBF_SVM": 8,
+      "RandomForest": 6,
+      "LogisticRegression": 5,
+      "KNN": 8,
+      "FisherLDA": 5
+    },
+    "representations_per_model": 5,
+    "n_candidates": 160,
+    "n_cv_fits": 800,
+    "n_protocol_fits": 50,
+    "n_final_models": 10,
+    "scope": "仅PCA降维与未降维基准；各维数均遍历同一有限网格，不是全局最优搜索。"
+  },
+  "real_har_full_search_executed": false,
+  "real_har_fisher_check_executed": false,
+  "windows_execution_tested": false,
+  "real_har_data_in_input_archive": false,
+  "formal_chinese_figure_font_rendering_verified": false,
+  "scope": "Software correctness on synthetic fixtures, plan and resume checks only. No new HAR scores or chosen dimension inferred."
+}

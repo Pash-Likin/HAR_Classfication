@@ -1,0 +1,32 @@
+{
+  "revision": "pca-only-highest-cv-2.1",
+  "previous_library_version": 1,
+  "original_archive_sha256": "89afb557547d7543c103ac82192df2e524fab7f4da8bbf64c52f41031920505e",
+  "previous_pca_archive_sha256": "c2592d069a45e68ee43f07aba0f0d3209bebcfcb0ec5e8be61350df931b09ecd",
+  "changed_original_files": [
+    "config.json",
+    "docs/protocol.md",
+    "README.md",
+    "redraw_figures.py",
+    "run_experiment.py",
+    "src/har_study/audit.py",
+    "src/har_study/diagnostics.py",
+    "src/har_study/plots.py",
+    "src/har_study/search.py",
+    "src/har_study/stage_timing.py",
+    "src/har_study/study.py",
+    "src/har_study/verify.py",
+    "tests/check_real_fisher.py",
+    "tests/test_compact_runner.py",
+    "tests/test_core.py",
+    "tests/test_search.py",
+    "tests/test_stage_timing.py",
+    "tests/test_visuals.py",
+    "tests/test_workflow.py",
+    "verify_results.py"
+  ],
+  "original_historical_files_byte_identical": true,
+  "preserved_historical_file_count": 154,
+  "previous_software_checks_byte_identical": true,
+  "new_har_experiment_completed": false
+}

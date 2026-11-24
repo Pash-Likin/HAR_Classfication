@@ -1,0 +1,25 @@
+{
+  "original_archive_sha256": "89afb557547d7543c103ac82192df2e524fab7f4da8bbf64c52f41031920505e",
+  "changed_original_files": [
+    "README.md",
+    "config.json",
+    "docs/protocol.md",
+    "redraw_figures.py",
+    "run_experiment.py",
+    "src/har_study/plots.py",
+    "src/har_study/search.py",
+    "src/har_study/stage_timing.py",
+    "src/har_study/study.py",
+    "tests/check_real_fisher.py",
+    "tests/test_compact_runner.py",
+    "tests/test_core.py",
+    "tests/test_search.py",
+    "tests/test_stage_timing.py",
+    "tests/test_visuals.py",
+    "tests/test_workflow.py",
+    "verify_results.py"
+  ],
+  "preserved_historical_file_count": 154,
+  "original_historical_files_byte_identical": true,
+  "scope": "Original outputs/20261027, report and validation members are historical; new PCA run not executed."
+}

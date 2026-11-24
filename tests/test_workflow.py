@@ -11,7 +11,7 @@ import pandas as pd
 from threadpoolctl import threadpool_limits
 from test_core import fixture, small_config, ROOT
 sys.path.insert(0, str(ROOT / "src"))
-from har_study.study import (grouped_folds, search_candidates, select_configs, protocol_comparison,
+from har_study.study import (grouped_folds, search_candidates, select_configs,
                             fit_selected, evaluate_test, paired_subject_bootstrap, benchmark)
 
 
@@ -26,21 +26,28 @@ class WorkflowTest(unittest.TestCase):
             c['knn_grid']={'model__n_neighbors':[3], 'model__weights':['uniform']}
             folds, _ = grouped_folds(train, c)
             candidate = search_candidates(train, c, folds, out, workers=1, cache=out / ".cache")
-            self.assertEqual(len(candidate), 30)
-            chosen, curve = select_configs(candidate, c["allowed_macro_f1_drop"])
-            self.assertEqual(len(chosen), 15)
-            self.assertEqual(len(curve), 25)
-            protocol_comparison(train, c, folds, out)
+            self.assertEqual(len(candidate), 18)
+            chosen, curve = select_configs(candidate)
+            self.assertEqual(len(chosen), 10)
+            self.assertEqual(len(curve), 15)
             fitted = fit_selected(train, chosen, c, out)
+            stages = pd.read_csv(out / "tables/final_fit_and_size.csv")
+            self.assertEqual(len(stages), 10)
+            self.assertTrue({"scale_fit_seconds", "reduce_fit_seconds",
+                             "classifier_fit_seconds", "final_fit_seconds"} <= set(stages.columns))
+            self.assertTrue((stages.final_fit_seconds > 0).all())
             evaluate_test(test, fitted, chosen, out)
             paired_subject_bootstrap(out, c)
             benchmark(fitted, test.X, c, out)
             preds = pd.read_csv(out / "tables/test_predictions.csv")
-            self.assertEqual(len(preds), len(test.y) * 15)
+            self.assertEqual(len(preds), len(test.y) * 10)
             scores = pd.read_csv(out / "tables/test_metrics.csv")
-            self.assertEqual(len(scores), 15)
+            self.assertEqual(len(scores), 10)
             self.assertTrue(scores.accuracy.between(0, 1).all())
-            self.assertEqual(len(pd.read_csv(out / "tables/timing_raw.csv")), 60)
+            self.assertEqual(len(pd.read_csv(out / "tables/timing_raw.csv")), 40)
+            self.assertEqual(set(candidate.method), {"full", "pca"})
+            self.assertEqual(len(pd.read_csv(out / "tables/subject_bootstrap.csv")), 5)
+            self.assertFalse((out / "tables/selected_features.csv").exists())
             for sid, pipe in fitted.items():
                 reloaded = joblib.load(out / "models" / f"{sid}.joblib")
                 np.testing.assert_array_equal(pipe.predict(test.X), reloaded.predict(test.X))

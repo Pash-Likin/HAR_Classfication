@@ -1,11 +1,4 @@
-#!/usr/bin/env python3
-"""完整五模型实验入口：适度调参、断点恢复、验证和中文绘图。
 
-python run_experiment.py --plan
-python run_experiment.py
-python run_experiment.py --resume outputs/实际目录
-python run_experiment.py --verify-only outputs/实际目录
-"""
 from __future__ import annotations
 
 import argparse
@@ -47,12 +40,12 @@ except ImportError as exc:
         f"导入错误：{exc}"
     ) from exc
 
-VERSION = "integrated-five-models-stage-timing-1.2"
+VERSION = "pca-subject-only-highest-cv-2.2"
 MODEL_ORDER = ("RBF_SVM", "RandomForest", "LogisticRegression", "KNN", "FisherLDA")
-METHODS = ("full", "pca", "anova")
+METHODS = ("full", "pca")
 GRID_KEYS = {"RBF_SVM": "svm_grid", "RandomForest": "rf_grid",
              "LogisticRegression": "lr_grid", "KNN": "knn_grid", "FisherLDA": "lda_grid"}
-METHOD_CN = {"full": "全特征", "pca": "PCA", "anova": "ANOVA筛选"}
+METHOD_CN = {"full": "全特征", "pca": "PCA"}
 ACTIVITY_CN = ["行走", "上楼", "下楼", "坐", "站立", "躺卧"]
 FIXED_PARAMS = {
     "RBF_SVM": {"model__C": 10.0, "model__gamma": 0.001},
@@ -113,7 +106,8 @@ def previous_grids() -> dict:
 
 
 def build_search_plan(config: dict) -> dict:
-    """完整遍历适度扩展后的有限网格，不再使用RF大范围随机抽样。"""
+    """每个PCA维数遍历相同分类器网格；保留未降维基准。"""
+    core.validate_config(config)
     parameters = {m: list(ParameterGrid(config[GRID_KEYS[m]])) for m in config["models"]}
     old = previous_grids()
     for model in config["models"]:
@@ -121,16 +115,18 @@ def build_search_plan(config: dict) -> dict:
             raise ValueError(f"{model}网格缺少原版本候选。为保持旧/新搜索对照，请保留原候选。")
         if canonical(FIXED_PARAMS[model]) not in {canonical(p) for p in parameters[model]}:
             raise ValueError(f"{model}缺少固定参数对照。")
-    nrep = 1 + 2 * len(config["dimensions"])
+    nrep = 1 + (len(METHODS) - 1) * len(config["dimensions"])
     n = nrep * sum(len(values) for values in parameters.values())
     return {
         "version": VERSION, "seed": config["seed"], "parameter_sets": parameters,
+        "methods": list(METHODS), "pca_dimensions": list(config["dimensions"]),
+        "pca_selection": config["pca_selection"],
         "parameter_counts": {m: len(values) for m, values in parameters.items()},
         "representations_per_model": nrep, "n_candidates": n,
         "n_cv_fits": n * config["cv_folds"],
-        "n_protocol_fits": 2 * len(config["models"]) * config["cv_folds"],
-        "n_final_models": 3 * len(config["models"]),
-        "scope": "五模型均完整遍历给定有限网格；不是全局最优搜索。",
+        "cv_split": "subject_grouped_only",
+        "n_final_models": len(METHODS) * len(config["models"]),
+        "scope": "仅PCA降维与未降维基准；训练集5折按人员分组，不使用随机窗口划分；各维数均遍历同一有限网格。",
     }
 
 
@@ -268,7 +264,8 @@ def comparison_tables(candidates: pd.DataFrame, config: dict, out: Path) -> None
         fixed_rows.append({"model": model, "method": method, "k": int(k),
             "fixed_candidate_id": base.candidate_id, "fixed_params_json": base.params_json,
             "fixed_cv_macro_f1": base.cv_macro_f1, "fixed_cv_std": base.cv_macro_f1_std,
-            "tuned_candidate_id": tuned.candidate_id, "tuned_cv_macro_f1": tuned.cv_macro_f1,
+            "tuned_candidate_id": tuned.candidate_id, "tuned_params_json": tuned.params_json,
+            "tuned_cv_macro_f1": tuned.cv_macro_f1, "tuned_cv_std": tuned.cv_macro_f1_std,
             "development_tuning_difference_pp": 100 * (tuned.cv_macro_f1 - base.cv_macro_f1)})
         if old_best is not None:
             old_rows.append({"model": model, "method": method, "k": int(k),
@@ -289,6 +286,24 @@ def comparison_tables(candidates: pd.DataFrame, config: dict, out: Path) -> None
     atomic_csv(old_rows, out / "tables/old_vs_extended_cv.csv")
     cols = ["model", "method", "k", "parameter", "selected_value", "numeric_min", "numeric_max", "note"]
     atomic_csv(pd.DataFrame(boundaries, columns=cols), out / "tables/boundary_diagnostics.csv")
+
+
+def dimension_comparison_table(out: Path, selected: pd.DataFrame) -> None:
+    """从同一次搜索提取四维度固定/调参曲线；不额外训练、不使用测试分数。"""
+    comparison = pd.read_csv(out / "tables/fixed_parameter_comparison.csv", float_precision="round_trip")
+    pca = comparison[comparison.method == "pca"].copy()
+    chosen = selected[selected.method == "pca"].set_index("model")
+    pca["selected_dimension"] = pca.model.map(chosen.k).astype(int)
+    pca["is_selected_dimension"] = pca.k == pca.selected_dimension
+    full_scores = selected[selected.method == "full"].set_index("model").cv_macro_f1
+    pca["full_cv_macro_f1"] = pca.model.map(full_scores)
+    pca["cv_delta_from_full_pp"] = 100 * (pca.tuned_cv_macro_f1 - pca.full_cv_macro_f1)
+    ranked = pca.sort_values(["model", "tuned_cv_macro_f1", "k", "tuned_candidate_id"],
+                             ascending=[True, False, True, True], kind="stable")
+    pca["cv_rank"] = ranked.groupby("model").cumcount().add(1).reindex(pca.index)
+    pca["selection_rule"] = pca.model.map(chosen.selection_rule)
+    pca["evidence_scope"] = "training_grouped_cv_only; not_independent_test_evidence"
+    atomic_csv(pca.sort_values(["model", "k"]), out / "tables/pca_dimension_comparison.csv")
 
 
 def lock_selection(out: Path, selected: pd.DataFrame) -> dict:
@@ -322,7 +337,7 @@ def run_extended(root: Path, config: dict, plan: dict, out: Path,
     token = fingerprint(context)
     if resume:
         if not out.is_dir() or not (out / "resume_context.json").is_file():
-            raise FileNotFoundError("恢复目录没有适度扩展搜索的断点上下文。")
+            raise FileNotFoundError("恢复目录没有本次PCA实验的断点上下文。")
         if read_json(out / "resume_context.json")["context_sha256"] != token:
             raise ValueError("数据、配置、脚本、软件版本或平台发生变化。不能复用这批断点，请新建实验。")
         if read_json(out / "manifest.json").get("status") == "completed":
@@ -344,7 +359,13 @@ def run_extended(root: Path, config: dict, plan: dict, out: Path,
             "source_data_hashes": context["data_hashes"],
             "source_code_hashes_sha256": sha256(out / "source_hashes.json"),
             "search_plan_sha256": sha256(out / "search_plan.json"),
-            "selection": "全特征、各维数同预算调参；选验证F1下降不超过0.01的最小维数；未达标保留诊断。",
+            "methods": list(METHODS), "pca_dimensions": config["dimensions"],
+            "validation_protocol": "subject_grouped_only",
+            "random_window_comparison": False,
+            "selection": "全特征和各PCA维数使用相同参数网格；选择平均训练分组CV Macro-F1最高的PCA维数及参数；完全同分优先较小维数，再按candidate_id稳定排序。",
+            "pca_selection": config["pca_selection"],
+            "selection_metric": "cv_macro_f1",
+            "dimension_comparison": "固定参数与调参曲线复用同次搜索，仅为训练分组CV开发期描述。",
             "prior_test_exposure": True,
             "interpretation": "扩展探索性实验，不是从未接触测试集的独立确认；不得用测试成绩回头改网格。",
             "not_preregistered": "本地配置及事件记录不等于第三方预注册。",
@@ -370,15 +391,19 @@ def run_extended(root: Path, config: dict, plan: dict, out: Path,
             event("training_loaded", n=len(train.y), n_subjects=len(np.unique(train.subjects)))
             candidates = run_search(train, config, plan, folds, out, workers, token)
             comparison_tables(candidates, config, out)
-            selected, curve = core.select_configs(candidates, config["allowed_macro_f1_drop"])
+            selected, curve = core.select_configs(candidates)
             atomic_csv(curve, out / "tables/compression_curve.csv")
             atomic_csv(selected, out / "tables/selected_configs.csv")
+            dimension_comparison_table(out, selected)
             lock_selection(out, selected)
             event("selection_locked", sha256=sha256(out / "selection_lock.json"))
-            # 参数锁定后不会根据以下协议对照/测试结果更改配置。
-            core.protocol_comparison(train, config, folds, out)
+            # 仅执行人员分组交叉验证；不创建随机窗口划分，也不重复拟合协议对照。
             fitted = core.fit_selected(train, selected, config, out)
             event("final_models_fitted")
+            # 控制变量试验只使用官方训练集与已锁定的全特征最优超参数，
+            # 在加载官方测试集之前完成，不能根据测试成绩调整或选择配置。
+            core.controlled_fit_costs(train, selected, config, out)
+            event("controlled_fit_costs_completed")
             test = load_split(root, "test")
             atomic_json(out / "data_audit.json", audit_splits(train, test))
             atomic_csv([{"row_id": i, "subject": int(s), "activity": int(y)}
@@ -401,7 +426,7 @@ def run_extended(root: Path, config: dict, plan: dict, out: Path,
             elapsed_seconds=time.perf_counter() - start,
             selection_lock_sha256=sha256(out / "selection_lock.json"),
             n_candidates=plan["n_candidates"], n_cv_fits=plan["n_cv_fits"],
-            n_final_models=plan["n_final_models"], n_protocol_fits=plan["n_protocol_fits"],
+            n_final_models=plan["n_final_models"], validation_protocol="subject_grouped_only",
             stage_timing_completed=True,
             elapsed_scope="当前调用用时；断点此前耗时见各任务记录，不冒称从头运行总时长。")
         atomic_json(out / "manifest.json", manifest)
@@ -429,6 +454,13 @@ def verify_extended(out: Path, data_root: Path) -> dict:
     config = read_json(out / "config_frozen.json")
     plan = read_json(out / "search_plan.json")
     protocol = read_json(out / "protocol_frozen.json")
+    if plan.get("cv_split") != "subject_grouped_only" or protocol.get("validation_protocol") != "subject_grouped_only":
+        raise AssertionError("新实验必须明确使用人员分组验证。")
+    if protocol.get("random_window_comparison") is not False:
+        raise AssertionError("新实验不能包含随机窗口比较。")
+    for legacy_name in ("protocol_comparison.csv", "protocol_predictions.csv"):
+        if (out / "tables" / legacy_name).exists():
+            raise AssertionError(f"仅人员划分的运行不应产生 {legacy_name}")
     if canonical(plan) != canonical(build_search_plan(config)):
         raise AssertionError("搜索计划无法由冻结配置复算。")
     if protocol["search_plan_sha256"] != sha256(out / "search_plan.json"):
@@ -465,7 +497,7 @@ def verify_extended(out: Path, data_root: Path) -> dict:
     selected = pd.read_csv(out / "tables/selected_configs.csv")
     expected_ids = {f"{m}__{method}" for m in config["models"] for method in METHODS}
     if len(selected) != len(expected_ids) or set(selected.selection_id) != expected_ids:
-        raise AssertionError("最终方案数量应等于配置中的模型数乘以3。")
+        raise AssertionError("最终方案数量应等于配置中的模型数乘以2（全特征与PCA）。")
     predictions = pd.read_csv(out / "tables/test_predictions.csv")
     overall = pd.read_csv(out / "tables/test_metrics.csv")
     activities = pd.read_csv(out / "tables/test_activities.csv")
@@ -541,23 +573,25 @@ def verify_and_draw(out: Path, data_root: Path, font_path=None) -> None:
 
 
 def describe_plan(plan: dict) -> None:
+    print(f"[Plan] Methods: {', '.join(plan['methods'])}; PCA dimensions: {plan['pca_dimensions']}")
+    print(f"[Plan] PCA selection: {plan['pca_selection']}; exact ties prefer the smaller dimension.")
     for model, n in plan["parameter_counts"].items():
         kind = "finite exhaustive grid"
         print(f"[Plan] {model}: {n} combinations per representation; {kind}")
     print(f"[Plan] {plan['representations_per_model']} representations/model; "
           f"{plan['n_candidates']} candidates; {plan['n_cv_fits']} primary CV fits; "
-          f"{plan['n_protocol_fits']} fixed-parameter protocol fits; {plan['n_final_models']} final models.")
+          f"{plan['n_final_models']} final models; validation by subject only.")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="HAR五模型适度扩展搜索：独立入口，保存断点，核验并绘制混淆矩阵/参数热力图")
+    parser = argparse.ArgumentParser(description="HAR五模型PCA实验：维数与分类器联合搜索，保存断点，核验并绘图")
     parser.add_argument("--data", type=Path, help="官方ZIP或已解压目录；默认使用项目data/")
-    parser.add_argument("--out", type=Path, help="新输出目录；默认outputs/compact_时间，不覆盖旧结果")
+    parser.add_argument("--out", type=Path, help="新输出目录；默认outputs/YYYYMMDD，不覆盖旧结果")
     parser.add_argument("--workers", type=int, default=2, help="搜索进程数，默认2；计时仍为单线程")
     parser.add_argument("--font", type=Path, help="可选：本机中文字体文件")
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--plan", action="store_true", help="只打印搜索规模，不读取数据或训练")
-    actions.add_argument("--resume", type=Path, help="继续中断的适度扩展搜索；配置和版本必须不变")
+    actions.add_argument("--resume", type=Path, help="继续中断的PCA实验；配置和版本必须不变")
     actions.add_argument("--verify-only", type=Path, help="复核已完成的扩展结果并重绘图片，不重新训练")
     args = parser.parse_args()
     if args.workers < 1:
@@ -568,7 +602,7 @@ def main() -> int:
         parser.error("当前项目不是所需的五模型整合版本。")
     if args.resume:
         if not all((args.resume / name).is_file() for name in ("config_frozen.json", "search_plan.json", "resume_context.json")):
-            parser.error("--resume指定的目录缺少适度扩展搜索断点文件；请填写实际outputs/compact_目录。")
+            parser.error("--resume指定的目录缺少本次PCA实验断点文件；请填写实际outputs/pca_best_cv_目录。")
         config = read_json(args.resume / "config_frozen.json")
         plan = read_json(args.resume / "search_plan.json")
         if canonical(config) != canonical(build_config()):
@@ -588,7 +622,7 @@ def main() -> int:
             verify_and_draw(args.verify_only, root, args.font)
             return 0
         describe_plan(plan)
-        out = args.resume or args.out or ROOT / "outputs" / datetime.now().strftime("compact_%Y%m%d_%H%M%S_%f")
+        out = args.resume or args.out or ROOT / "outputs" / datetime.now().strftime("%Y%m%d")
         run_extended(root, config, plan, out, args.workers, resume=bool(args.resume))
         verify_and_draw(out, root, args.font)
         print(f"[Done] {out.resolve()}", flush=True)

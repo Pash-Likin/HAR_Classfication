@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from .data import sha256
-from .study import metrics, select_configs
+from .study import metrics, select_configs, validate_config
 
 
 def verify_run(run: Path) -> dict:
@@ -19,6 +19,7 @@ def verify_run(run: Path) -> dict:
     if audit["train"]["samples"] != 7352 or audit["test"]["samples"] != 2947:
         raise AssertionError("不是官方完整规模。")
     config = json.loads((run / "config_frozen.json").read_text(encoding="utf-8"))
+    validate_config(config)
     assignments = pd.read_csv(run / "splits/training_cv.csv")
     if len(assignments) != 7352 or not assignments.row_id.is_unique:
         raise AssertionError("CV验证索引不完整或重复。")
@@ -28,8 +29,8 @@ def verify_run(run: Path) -> dict:
         raise AssertionError("同一人员被拆到不同验证折。")
     if assignments.validation_fold.nunique() != config["cv_folds"]:
         raise AssertionError("交叉验证折数不符。")
-    candidates = pd.read_csv(run / "tables/cv_candidates.csv")
-    fold_metrics = pd.read_csv(run / "tables/cv_folds.csv")
+    candidates = pd.read_csv(run / "tables/cv_candidates.csv", float_precision="round_trip")
+    fold_metrics = pd.read_csv(run / "tables/cv_folds.csv", float_precision="round_trip")
     if fold_metrics.groupby("candidate_id").size().ne(config["cv_folds"]).any():
         raise AssertionError("部分候选参数缺少某折结果。")
     for candidate in candidates.itertuples():
@@ -38,10 +39,15 @@ def verify_run(run: Path) -> dict:
             raise AssertionError("CV平均分与逐折分数不一致。")
         if not np.isclose(values.macro_f1.std(ddof=0), candidate.cv_macro_f1_std, atol=1e-9):
             raise AssertionError("CV标准差不一致。")
-    expected, _ = select_configs(candidates, config["allowed_macro_f1_drop"])
-    selected = pd.read_csv(run / "tables/selected_configs.csv")
+    expected, _ = select_configs(candidates)
+    selected = pd.read_csv(run / "tables/selected_configs.csv", float_precision="round_trip")
     if expected.set_index("selection_id").candidate_id.to_dict() != selected.set_index("selection_id").candidate_id.to_dict():
         raise AssertionError("实际选择不符合预先设定的规则。")
+    for field in ("selection_rule", "selection_metric"):
+        if field not in selected or expected.set_index("selection_id")[field].to_dict() != selected.set_index("selection_id")[field].to_dict():
+            raise AssertionError("选择规则或评价指标标记与最高CV得分协议不一致。")
+    if {"cv_threshold", "meets_cv_tolerance"} & set(selected.columns):
+        raise AssertionError("新实验不能混入旧容忍阈值选模字段。")
     lock = json.loads((run / "selection_lock.json").read_text(encoding="utf-8"))
     if lock["cv_sha256"] != sha256(run / "tables/cv_candidates.csv"):
         raise AssertionError("锁定后CV表发生变化。")

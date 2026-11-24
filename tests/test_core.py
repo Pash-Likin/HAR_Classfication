@@ -73,8 +73,12 @@ class CoreTests(unittest.TestCase):
         c = config(); c["dimensions"] = [561]
         with self.assertRaises(ValueError): validate_config(c)
 
-    def test_tolerance_unit(self):
-        c = config(); c["allowed_macro_f1_drop"] = 1
+    def test_pca_selection_requires_highest_cv_score(self):
+        c = config(); c["pca_selection"] = "smallest_eligible_k"
+        with self.assertRaises(ValueError): validate_config(c)
+
+    def test_legacy_tolerance_config_rejected(self):
+        c = config(); c["allowed_macro_f1_drop"] = .01
         with self.assertRaises(ValueError): validate_config(c)
 
     def test_group_isolation_and_coverage(self):
@@ -110,29 +114,89 @@ class CoreTests(unittest.TestCase):
         d = fixture(range(1, 4)); p = make_pipeline("RBF_SVM", "pca", 4, small_config()).fit(d.X, d.y)
         self.assertEqual(p[:-1].transform(d.X).shape, (len(d.y), 4))
 
-    def test_selection_dimension(self):
-        d = fixture(range(1, 4)); p = make_pipeline("RandomForest", "anova", 8, small_config()).fit(d.X, d.y)
-        self.assertEqual(p.named_steps["reduce"].get_support().sum(), 8)
+    def test_feature_selection_route_removed(self):
+        with self.assertRaises(ValueError):
+            make_pipeline("RandomForest", "anova", 8, small_config())
 
     def test_clone_and_repeat_predictions(self):
         d = fixture(range(1, 4)); c = small_config()
-        p = make_pipeline("RandomForest", "anova", 8, c)
+        p = make_pipeline("RandomForest", "pca", 8, c)
         a = clone(p).fit(d.X, d.y).predict(d.X)
         b = clone(p).fit(d.X, d.y).predict(d.X)
         np.testing.assert_array_equal(a, b)
 
-    def test_smallest_acceptable_k_and_failure_branch(self):
+    def test_highest_pca_score_even_when_all_pca_scores_below_full(self):
         rows = []
         for model in ("RBF_SVM", "RandomForest"):
-            for method, vals in (("full", [(561, .96)]), ("pca", [(20, .94), (50, .955), (100, .97), (200, .98)]),
-                                 ("anova", [(20, .90), (50, .91), (100, .92), (200, .93)])):
+            pca_scores = [(32, .94), (64, .955), (96, .97), (128, .98)] if model == "RBF_SVM" else [
+                (32, .90), (64, .93), (96, .92), (128, .91)]
+            for method, vals in (("full", [(561, .96)]), ("pca", pca_scores)):
                 for k, score in vals:
                     rows.append({"candidate_id": f"{model}_{method}_{k}", "model": model, "method": method,
                                  "k": k, "cv_macro_f1": score, "params_json": "{}"})
-        chosen, _ = select_configs(pd.DataFrame(rows), .01)
-        self.assertTrue((chosen[chosen.method == "pca"].k == 50).all())
-        self.assertTrue((chosen[chosen.method == "anova"].k == 200).all())
-        self.assertFalse(chosen[chosen.method == "anova"].meets_cv_tolerance.any())
+        chosen, _ = select_configs(pd.DataFrame(rows))
+        pca = chosen[chosen.method == "pca"].set_index("model")
+        self.assertEqual(pca.loc["RBF_SVM", "k"], 128)
+        self.assertEqual(pca.loc["RandomForest", "k"], 64)
+        self.assertAlmostEqual(pca.loc["RandomForest", "cv_delta_from_full_pp"], -3.0)
+        self.assertTrue((pca.selection_rule == "highest_cv_macro_f1").all())
+        self.assertTrue((chosen.selection_metric == "cv_macro_f1").all())
+        self.assertNotIn("meets_cv_tolerance", chosen)
+        self.assertNotIn("cv_threshold", chosen)
+
+    def test_dimension_selection_uses_tuned_parameters_at_each_k(self):
+        # 固定参数会偏向128维；64维调参后分数最高，应联合选中64维及其参数。
+        values = [("full", 561, "a", .96), ("full", 561, "b", .94),
+                  ("pca", 32, "a", .93), ("pca", 32, "b", .94),
+                  ("pca", 64, "a", .91), ("pca", 64, "b", .985),
+                  ("pca", 96, "a", .97), ("pca", 96, "b", .965),
+                  ("pca", 128, "a", .98), ("pca", 128, "b", .98)]
+        rows = [{"candidate_id": f"RBF_SVM_{method}_{k}_{parameter}", "model": "RBF_SVM",
+                 "method": method, "k": k, "cv_macro_f1": score,
+                 "params_json": json.dumps({"parameter": parameter})}
+                for method, k, parameter, score in values]
+        chosen, curve = select_configs(pd.DataFrame(rows))
+        selected = chosen[chosen.method == "pca"].iloc[0]
+        self.assertEqual(selected.k, 64)
+        self.assertEqual(json.loads(selected.params_json)["parameter"], "b")
+        self.assertEqual(json.loads(chosen[chosen.method == "full"].iloc[0].params_json)["parameter"], "a")
+        self.assertEqual(len(curve), 5)
+        self.assertEqual(curve[curve.k == 128].iloc[0].candidate_id, "RBF_SVM_pca_128_a")
+
+    def test_exact_score_tie_prefers_smaller_dimension_then_stable_candidate(self):
+        values = [("full", 561, "full", .96), ("pca", 32, "z_32", .97),
+                  ("pca", 32, "b_32", .97), ("pca", 64, "a_64", .97),
+                  ("pca", 96, "a_96", .96), ("pca", 128, "a_128", .95)]
+        rows = [{"candidate_id": cid, "model": "RBF_SVM", "method": method,
+                 "k": k, "cv_macro_f1": score, "params_json": "{}"}
+                for method, k, cid, score in values]
+        for records in (rows, list(reversed(rows))):
+            chosen, _ = select_configs(pd.DataFrame(records))
+            selected = chosen[chosen.method == "pca"].iloc[0]
+            self.assertEqual(selected.k, 32)
+            self.assertEqual(selected.candidate_id, "b_32")
+
+    def test_selection_rejects_legacy_feature_selection_candidates(self):
+        with self.assertRaises(ValueError):
+            select_configs(pd.DataFrame([{"method": "anova"}]))
+
+    def test_serialized_scores_preserve_near_tie_selection(self):
+        from har_study.study import save_table
+        rows = pd.DataFrame([
+            {"candidate_id": "full", "model": "KNN", "method": "full", "k": 561,
+             "cv_macro_f1": .94, "params_json": "{}"},
+            {"candidate_id": "pca32", "model": "KNN", "method": "pca", "k": 32,
+             "cv_macro_f1": .95, "params_json": "{}"},
+            {"candidate_id": "pca128", "model": "KNN", "method": "pca", "k": 128,
+             "cv_macro_f1": np.nextafter(.95, 1.0), "params_json": "{}"},
+        ])
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "cv_candidates.csv"
+            save_table(rows, path)
+            loaded = pd.read_csv(path, float_precision="round_trip")
+            np.testing.assert_array_equal(loaded.cv_macro_f1, rows.cv_macro_f1)
+            chosen, _ = select_configs(loaded)
+            self.assertEqual(chosen[chosen.method == "pca"].iloc[0].k, 128)
 
     def test_identical_prediction_metrics(self):
         values = np.array([1, 2, 3, 4, 5, 6])
@@ -183,6 +247,20 @@ class CoreTests(unittest.TestCase):
             td = Path(td)
             for m in ({"status": "running", "synthetic": False}, {"status": "completed", "synthetic": True}):
                 (td / "manifest.json").write_text(json.dumps(m))
+                with self.assertRaises(ValueError): verify_run(td)
+
+    def test_verifier_rejects_legacy_selection_protocol_before_reading_results(self):
+        # 仅构造协议检查所需的临时元数据，不生成或宣称真实HAR成绩。
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "manifest.json").write_text('{"status":"completed","synthetic":false}')
+            audit = {"train": {"subject_ids": [1], "samples": 7352},
+                     "test": {"subject_ids": [2], "samples": 2947}}
+            (td / "data_audit.json").write_text(json.dumps(audit))
+            wrong_rule = config(); wrong_rule["pca_selection"] = "smallest_eligible_k"
+            legacy = config(); legacy.pop("pca_selection"); legacy["allowed_macro_f1_drop"] = .01
+            for frozen in (wrong_rule, legacy):
+                (td / "config_frozen.json").write_text(json.dumps(frozen))
                 with self.assertRaises(ValueError): verify_run(td)
 
     def test_plot_rejects_synthetic(self):
